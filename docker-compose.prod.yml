@@ -1,47 +1,86 @@
+# В .env задаём API_IMAGE, POSTGRES_IMAGE, NGINX_IMAGE по digest и текущее COMPOSE_PROJECT_NAME.
+# DB_VOLUME_NAME берём из docker inspect shop-db-1, сохраняем существующий волюм и путь данных.
+# В secrets/api.env кладём DATABASE_URL, в secrets/db_password текущий пароль БД, файлы вне git с ограниченным доступом.
+# POSTGRES_PASSWORD_FILE не меняет пароль существующей БД, смену согласуем с api отдельно.
+# 1536 + 1536 + 128 = 3200 MiB, по free остаётся около 730 MiB для ОС и Docker.
+# После применения проверяем минимум 500 MiB available и потребление под нагрузкой.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   api:
-    image: registry.example.com/shop-api:latest
-    privileged: true
-    ports:
-      - "3000:3000"
+    image: ${API_IMAGE:?1.0.0}
+    env_file:
+      - /opt/shop/secrets/api.env
     environment:
-      DATABASE_URL: postgres://app:SuperSecret123@db:5432/shop
-      WEB_CONCURRENCY: "16"
+      WEB_CONCURRENCY: "2"
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    cpus: "1.0"
+    logging: *logging
     depends_on:
-      - db
-    restart: always
+      db:
+        condition: service_healthy
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
-      interval: 5s
-      timeout: 2s
+      test: ["CMD", "curl", "-f", "--max-time", "2", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 3s
       retries: 3
+      start_period: 20s
 
   db:
-    image: postgres:latest
-    ports:
-      - "5432:5432"
+    # Фиксируем фактический digest текущего image, major версию не меняем.
+    image: ${POSTGRES_IMAGE:?Укажите digest текущего PostgreSQL}
     environment:
       POSTGRES_USER: app
-      POSTGRES_PASSWORD: SuperSecret123
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
       POSTGRES_DB: shop
+    secrets:
+      - db_password
     volumes:
       - db-data:/var/lib/postgresql/data
-    restart: always
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    cpus: "0.75"
+    logging: *logging
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app -d shop"]
-      interval: 5s
+      interval: 10s
       timeout: 3s
       retries: 5
+      start_period: 20s
 
   nginx:
-    image: nginx:latest
+    image: ${NGINX_IMAGE:?Укажите digest nginx с wget}
     ports:
       - "80:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    mem_limit: 128m
+    memswap_limit: 128m
+    cpus: "0.25"
+    logging: *logging
     depends_on:
-      - api
-    restart: always
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+secrets:
+  db_password:
+    file: /opt/shop/secrets/db_password
 
 volumes:
   db-data:
+    external: true
+    name: ${DB_VOLUME_NAME:?db-data}

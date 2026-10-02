@@ -5,3 +5,8 @@
 *.key
 *.pem
 *.local
+secrets/
+.api-image.env
+.previous-api-image*
+.deploy.lock
+.env.tmp

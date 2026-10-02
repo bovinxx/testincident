@@ -1,36 +1,72 @@
 stages:
-  - deploy
   - test
   - build
+  - deploy
 
 variables:
-  IMAGE: registry.example.com/shop-api:latest
+  IMAGE_TAG: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
 
-before_script:
-  - echo "$PROD_SSH_PRIVATE_KEY"
+test:
+  stage: test
+  image: node:22.14.0-alpine3.21
+  script:
+    - npm ci
+    - npm test
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
 
 build:
   stage: build
+  image: docker:27.5.1-cli
+  services:
+    - name: docker:27.5.1-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: /certs/client
   script:
-    - docker build -t "$IMAGE" .
-    - docker push "$IMAGE"
-  only:
-    - main
-test:
-  stage: test
-  image: node:20
-  script:
-    - npm install
-    - npm test
+    - printf '%s' "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - docker build --pull -t "$IMAGE_TAG" .
+    - docker push "$IMAGE_TAG"
+    - docker image inspect "$IMAGE_TAG" --format 'API_IMAGE={{index .RepoDigests 0}}' > image.env
+  artifacts:
+    reports:
+      dotenv: image.env
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+.ssh:
+  image: alpine:3.21.3
+  before_script:
+    - apk add --no-cache openssh-client
+    - install -m 700 -d ~/.ssh
+    - cp "$PROD_SSH_PRIVATE_KEY" ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - cp "$PROD_SSH_KNOWN_HOSTS" ~/.ssh/known_hosts
 
 deploy:
+  extends: .ssh
   stage: deploy
+  resource_group: production
+  environment: production
   script:
-    - >
-      ssh deploy@prod
-      "cd /opt/shop &&
-      docker compose down -v &&
-      docker compose pull &&
-      docker compose up -d"
-  only:
-    - main
+    - ssh "$PROD_SSH_TARGET" 'mkdir -p /opt/shop/scripts'
+    - scp docker-compose.prod.yml "$PROD_SSH_TARGET:/opt/shop/docker-compose.prod.yml"
+    - scp scripts/deploy.sh scripts/rollback.sh "$PROD_SSH_TARGET:/opt/shop/scripts/"
+    - ssh "$PROD_SSH_TARGET" "bash /opt/shop/scripts/deploy.sh deploy '$API_IMAGE'"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+rollback:
+  extends: .ssh
+  stage: deploy
+  resource_group: production
+  environment: production
+  needs: []
+  script:
+    - ssh "$PROD_SSH_TARGET" 'bash /opt/shop/scripts/rollback.sh'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  allow_failure: true
